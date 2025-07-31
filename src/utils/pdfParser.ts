@@ -1,5 +1,6 @@
 import * as pdfjsLib from "pdfjs-dist";
 import "/node_modules/pdfjs-dist/build/pdf.worker.mjs";
+import { ai } from "./geminiModel";
 
 export interface ParsedTransaction {
   date: string;
@@ -8,6 +9,7 @@ export interface ParsedTransaction {
   balance?: number;
   type: "debit" | "credit";
   category?: string;
+  confidence?: number;
 }
 
 export interface BankStatementData {
@@ -19,32 +21,55 @@ export interface BankStatementData {
   closingBalance?: number;
 }
 
-// Bank patterns for different statement formats
+interface ColumnDefinition {
+  name: string;
+  dataType: "date" | "text" | "amount" | "balance";
+  confidence: number;
+}
+
+//  SDK-powered helper function
+async function callAI(prompt: string): Promise<string> {
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.0-flash-001",
+      contents: prompt,
+    });
+    const content = response.text;
+
+    if (!content) {
+      throw new Error("No response from AI API");
+    }
+    return content;
+  } catch (error: any) {
+    console.error(`nAI API error (model: ):`, error.message);
+    throw error;
+  }
+}
+
+// AI-powered bank name detection
+async function detectBankNameAI(text: string): Promise<string> {
+  const prompt = `Extract the bank name from the following PDF text:\n\n${text}\n\nOnly respond with the bank name.`;
+  return callAI(prompt);
+}
+
+// AI-powered column structure inference
+async function inferColumnsAI(headerLine: string): Promise<ColumnDefinition[]> {
+  const prompt = `Given this table header from a bank statement: "${headerLine}", map each column to a standard data type (date, text, amount, balance). Respond as JSON with keys: name, dataType, confidence (0-1).`;
+  const response = await callAI(prompt);
+  return JSON.parse(response);
+}
+
+// AI-powered transaction categorization
+async function categorizeTransactionAI(
+  description: string
+): Promise<{ category: string; confidence: number }> {
+  const prompt = `Categorize this transaction description: "${description}". Return the category (like Food, Travel, Income) and confidence score between 0 and 1 as JSON.`;
+  const response = await callAI(prompt);
+  return JSON.parse(response);
+}
+
+// Fallback patterns
 const BANK_PATTERNS = {
-  chase: {
-    name: "Chase Bank",
-    datePattern: /(\d{2}\/\d{2}\/\d{4}|\d{2}\/\d{2})/g,
-    amountPattern: /[\$]?[\-]?[\d,]+\.[\d]{2}/g,
-    accountPattern: /Account\s+Number[:\s]+(\d+)/i,
-    transactionPattern:
-      /(\d{2}\/\d{2}\/\d{4}|\d{2}\/\d{2})\s+(.+?)\s+([\-\$\d,\.]+)\s*([\$\d,\.]+)?/g,
-  },
-  bankOfAmerica: {
-    name: "Bank of America",
-    datePattern: /(\d{2}\/\d{2}\/\d{4})/g,
-    amountPattern: /[\$]?[\-]?[\d,]+\.[\d]{2}/g,
-    accountPattern: /Account\s+number[:\s]+(\d+)/i,
-    transactionPattern:
-      /(\d{2}\/\d{2}\/\d{4})\s+(.+?)\s+([\-\$\d,\.]+)\s*([\$\d,\.]+)?/g,
-  },
-  wellsFargo: {
-    name: "Wells Fargo",
-    datePattern: /(\d{2}\/\d{2}\/\d{4})/g,
-    amountPattern: /[\$]?[\-]?[\d,]+\.[\d]{2}/g,
-    accountPattern: /Account\s+Number[:\s]+(\d+)/i,
-    transactionPattern:
-      /(\d{2}\/\d{2}\/\d{4})\s+(.+?)\s+([\-\$\d,\.]+)\s*([\$\d,\.]+)?/g,
-  },
   generic: {
     name: "Generic Bank",
     datePattern: /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/g,
@@ -63,40 +88,50 @@ export async function parsePDFStatement(
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
     let fullText = "";
+    let headerLine = "";
 
-    // Extract text from all pages
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
       const textContent = await page.getTextContent();
-      // Fix: properly type the textContent items
       const pageText = textContent.items
-        .map((item: any) => {
-          // Some items might not have str property
-          return item.str || "";
-        })
+        .map((item: any) => item.str || "")
         .join(" ");
       fullText += pageText + "\n";
+
+      if (i === 1) {
+        const lines = pageText.split("\n");
+        headerLine =
+          lines.find((line) =>
+            line.match(/date|description|amount|balance/i)
+          ) || "";
+      }
     }
 
-    // Detect bank type
-    const bankType = detectBankType(fullText);
-    const pattern = BANK_PATTERNS[bankType];
-
-    // Extract account information
-    const accountMatch = fullText.match(pattern.accountPattern);
+    const bankName = await detectBankNameAI(fullText);
+    const accountMatch = fullText.match(BANK_PATTERNS.generic.accountPattern);
     const accountNumber = accountMatch ? accountMatch[1] : "Unknown";
-
-    // Extract statement period
     const statementPeriod = extractStatementPeriod(fullText);
 
-    // Parse transactions
-    const transactions = parseTransactions(fullText, pattern);
+    let columns: ColumnDefinition[] = [];
+    if (headerLine) {
+      try {
+        columns = await inferColumnsAI(headerLine);
+      } catch (error) {
+        console.warn("AI column inference failed, using fallback", error);
+        columns = [
+          { name: "Date", dataType: "date", confidence: 0.9 },
+          { name: "Description", dataType: "text", confidence: 0.9 },
+          { name: "Amount", dataType: "amount", confidence: 0.9 },
+          { name: "Balance", dataType: "balance", confidence: 0.8 },
+        ];
+      }
+    }
 
-    // Extract balances
+    const transactions = await parseTransactions(fullText, columns);
     const { openingBalance, closingBalance } = extractBalances(fullText);
 
     return {
-      bankName: pattern.name,
+      bankName,
       accountNumber,
       statementPeriod,
       transactions,
@@ -113,78 +148,59 @@ export async function parsePDFStatement(
   }
 }
 
-function detectBankType(text: string): keyof typeof BANK_PATTERNS {
-  const lowerText = text.toLowerCase();
+// Rest of the functions (parseTransactions, parseTransactionsAlternative, normalizeDate, categorizeTransaction, extractStatementPeriod, extractBalances) remain unchanged from the previous version.
 
-  if (lowerText.includes("chase") || lowerText.includes("jpmorgan")) {
-    return "chase";
-  } else if (
-    lowerText.includes("bank of america") ||
-    lowerText.includes("bofa")
-  ) {
-    return "bankOfAmerica";
-  } else if (lowerText.includes("wells fargo")) {
-    return "wellsFargo";
-  }
-
-  return "generic";
-}
-
-function extractStatementPeriod(text: string): string {
-  // Look for common statement period patterns
-  const periodPatterns = [
-    /Statement\s+Period[:\s]+(.+?)(?:\n|$)/i,
-    /Period[:\s]+(.+?)(?:\n|$)/i,
-    /From\s+(\d{1,2}\/\d{1,2}\/\d{2,4})\s+to\s+(\d{1,2}\/\d{1,2}\/\d{2,4})/i,
-    /(\w+\s+\d{1,2},?\s+\d{4})\s+through\s+(\w+\s+\d{1,2},?\s+\d{4})/i,
-  ];
-
-  for (const pattern of periodPatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      return match[1] + (match[2] ? ` - ${match[2]}` : "");
-    }
-  }
-
-  return "Unknown Period";
-}
-
-function parseTransactions(text: string, pattern: any): ParsedTransaction[] {
+async function parseTransactions(
+  text: string,
+  columns: ColumnDefinition[]
+): Promise<ParsedTransaction[]> {
   const transactions: ParsedTransaction[] = [];
   const lines = text.split("\n");
+  const pattern = BANK_PATTERNS.generic;
 
   for (const line of lines) {
     const match = line.match(pattern.transactionPattern);
     if (match) {
       const [, date, description, amount, balance] = match;
 
-      // Fix: Add null checks before calling replace
       if (!date || !description || !amount) {
-        continue; // Skip this transaction if essential fields are missing
+        continue;
       }
 
-      // Fix: better amount parsing to handle negative signs with null checks
       const cleanAmountStr = amount.replace(/[\$,]/g, "");
       const cleanAmount = parseFloat(cleanAmountStr);
-
       const cleanBalance = balance
         ? parseFloat(balance.replace(/[\$,]/g, ""))
         : undefined;
 
       if (!isNaN(cleanAmount)) {
+        let categoryInfo: { category: string; confidence: number } = {
+          category: "Other",
+          confidence: 0.5,
+        };
+        try {
+          categoryInfo = await categorizeTransactionAI(description);
+        } catch (error) {
+          console.warn(
+            `AI categorization failed for "${description}", using fallback`,
+            error
+          );
+          categoryInfo.category = categorizeTransaction(description);
+        }
+
         transactions.push({
           date: normalizeDate(date),
           description: description.trim(),
           amount: Math.abs(cleanAmount),
           balance: cleanBalance,
           type: cleanAmount < 0 ? "debit" : "credit",
-          category: categorizeTransaction(description),
+          category: categoryInfo.category,
+          confidence: categoryInfo.confidence,
         });
       }
     }
   }
 
-  // If no transactions found with regex, try alternative parsing
   if (transactions.length === 0) {
     return parseTransactionsAlternative(text);
   }
@@ -194,43 +210,33 @@ function parseTransactions(text: string, pattern: any): ParsedTransaction[] {
   );
 }
 
-function parseTransactionsAlternative(text: string): ParsedTransaction[] {
+async function parseTransactionsAlternative(text: string): ParsedTransaction[] {
   const transactions: ParsedTransaction[] = [];
   const lines = text.split("\n");
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-
-    // Look for date patterns
     const dateMatch = line.match(/(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/);
     if (dateMatch) {
       const date = dateMatch[1];
-
-      // Look for amount in the same line or next few lines
       let description = "";
       let amount = 0;
       let balance: number | undefined;
 
-      // Extract description and amount from current and next lines
       for (let j = 0; j < 3 && i + j < lines.length; j++) {
         const currentLine = lines[i + j];
         const amountMatch = currentLine.match(/([\-\$]?[\d,]+\.[\d]{2})/g);
 
         if (amountMatch && amountMatch.length > 0) {
-          // First amount is usually the transaction amount
           const amountStr = amountMatch[0].replace(/[\$,]/g, "");
           amount = parseFloat(amountStr);
-
-          // Second amount might be balance
           if (amountMatch.length > 1) {
             const balanceStr = amountMatch[1].replace(/[\$,]/g, "");
             balance = parseFloat(balanceStr);
           }
-
-          // Extract description (text before the amount)
           description = currentLine
-            .replace(/([\-\$]?[\d,]+\.[\d]{2})/g, "")
-            .replace(dateMatch[0], "") // Remove the date
+            .replace(/([\-$]?[\d,]+\.[\d]{2})/g, "")
+            .replace(dateMatch[0], "")
             .trim();
           break;
         } else {
@@ -239,13 +245,28 @@ function parseTransactionsAlternative(text: string): ParsedTransaction[] {
       }
 
       if (!isNaN(amount) && amount !== 0 && description.trim()) {
+        let categoryInfo: { category: string; confidence: number } = {
+          category: "Other",
+          confidence: 0.5,
+        };
+        try {
+          categoryInfo = await categorizeTransactionAI(description);
+        } catch (error) {
+          console.warn(
+            `AI categorization failed for "${description}", using fallback`,
+            error
+          );
+          categoryInfo.category = categorizeTransaction(description);
+        }
+
         transactions.push({
           date: normalizeDate(date),
           description: description.trim(),
           amount: Math.abs(amount),
           balance,
           type: amount < 0 ? "debit" : "credit",
-          category: categorizeTransaction(description),
+          category: categoryInfo.category,
+          confidence: categoryInfo.confidence,
         });
       }
     }
@@ -258,25 +279,19 @@ function parseTransactionsAlternative(text: string): ParsedTransaction[] {
 
 function normalizeDate(dateStr: string): string {
   try {
-    // Convert various date formats to ISO format
     const date = new Date(dateStr);
     if (!isNaN(date.getTime())) {
       return date.toISOString().split("T")[0];
     }
 
-    // Try different parsing approaches
     const parts = dateStr.split(/[\/\-]/);
     if (parts.length === 3) {
       let month: number, day: number, year: number;
-
-      // Handle 2-digit years
       let yearPart = parseInt(parts[2]);
       if (yearPart < 100) {
         yearPart += yearPart < 50 ? 2000 : 1900;
       }
-
-      // Assume MM/DD/YYYY format (common in US bank statements)
-      month = parseInt(parts[0]) - 1; // JavaScript months are 0-indexed
+      month = parseInt(parts[0]) - 1;
       day = parseInt(parts[1]);
       year = yearPart;
 
@@ -288,14 +303,11 @@ function normalizeDate(dateStr: string): string {
   } catch (error) {
     console.warn(`Failed to normalize date: ${dateStr}`, error);
   }
-
-  // Return original string if parsing fails
   return dateStr;
 }
 
 function categorizeTransaction(description: string): string {
   const desc = description.toLowerCase();
-
   if (
     desc.includes("deposit") ||
     desc.includes("salary") ||
@@ -349,8 +361,24 @@ function categorizeTransaction(description: string): string {
   ) {
     return "Healthcare";
   }
-
   return "Other";
+}
+
+function extractStatementPeriod(text: string): string {
+  const periodPatterns = [
+    /Statement\s+Period[:\s]+(.+?)(?:\n|$)/i,
+    /Period[:\s]+(.+?)(?:\n|$)/i,
+    /From\s+(\d{1,2}\/\d{1,2}\/\d{2,4})\s+to\s+(\d{1,2}\/\d{1,2}\/\d{2,4})/i,
+    /(\w+\s+\d{1,2},?\s+\d{4})\s+through\s+(\w+\s+\d{1,2},?\s+\d{4})/i,
+  ];
+
+  for (const pattern of periodPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      return match[1] + (match[2] ? ` - ${match[2]}` : "");
+    }
+  }
+  return "Unknown Period";
 }
 
 function extractBalances(text: string): {
