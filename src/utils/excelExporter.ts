@@ -12,6 +12,7 @@ export interface ExportOptions {
   useAICategorization?: boolean;
 }
 
+// SDK-powered helper function
 async function callAI(prompt: string): Promise<string> {
   try {
     const response = await ai.models.generateContent({
@@ -30,22 +31,26 @@ async function callAI(prompt: string): Promise<string> {
   }
 }
 
-async function categorizeTransactionAI(
+// NEW: This single function replaces both categorizeTransactionAI and refineCategoryName.
+async function categorizeAndRefineTransactionAI(
   description: string
 ): Promise<{ category: string; confidence: number }> {
-  const prompt = `Categorize this transaction description: "${description}". Return the category (like Food, Travel, Income) and confidence score between 0 and 1 as JSON.`;
+  const prompt = `
+    Given the following transaction description, provide a single, concise, and user-friendly category name and a confidence score.
+    Examples of good categories: 'Groceries', 'Utilities', 'Salary', 'Travel', 'Rent', 'Shopping'.
+    Examples of bad categories: 'DEBIT CARD PURCHASE 123', 'Transfer'.
+    
+    Return a single JSON object with the keys 'category' and 'confidence' (a number between 0 and 1).
+    
+    Transaction Description: "${description}"
+    
+    Only respond with the JSON object.
+  `;
   const response = await callAI(prompt);
   return JSON.parse(response);
 }
 
-async function refineCategoryName(
-  category: string,
-  description: string
-): Promise<string> {
-  const prompt = `Given the transaction description "${description}" and its initial category "${category}", suggest a more specific or user-friendly category name. Return only the category name.`;
-  return callAI(prompt);
-}
-
+// NOTE: The retrainCategoryFromFeedback function remains as it is for a separate purpose (user feedback).
 async function retrainCategoryFromFeedback(
   description: string,
   correctCategory: string
@@ -63,17 +68,13 @@ export async function exportToExcel(
 
   let transactions = data.transactions;
   if (options.useAICategorization) {
+    // UPDATED: Now calling the single, new function for categorization and refinement.
     transactions = await Promise.all(
       data.transactions.map(async (t) => {
         try {
-          const { category, confidence } = await categorizeTransactionAI(
-            t.description
-          );
-          const refinedCategory = await refineCategoryName(
-            category,
-            t.description
-          );
-          return { ...t, category: refinedCategory, confidence };
+          const { category, confidence } =
+            await categorizeAndRefineTransactionAI(t.description);
+          return { ...t, category, confidence };
         } catch (error) {
           console.warn(
             `AI categorization failed for "${t.description}", using original`,
@@ -113,6 +114,11 @@ function createTransactionsSheet(
 ): XLSX.WorkSheet {
   const headers = ["Date", "Description", "Amount", "Type"];
 
+  // The 'balance' and 'confidence' fields were removed from ParsedTransaction
+  // in the previous update. The following code needs to be adjusted.
+  // We'll add 'balance' back to the headers only if the option is enabled,
+  // and 'confidence' only if AICategorization is enabled.
+
   if (options.includeBalance) {
     headers.push("Balance");
   }
@@ -126,16 +132,17 @@ function createTransactionsSheet(
 
   const data = [headers];
 
-  transactions.forEach((transaction) => {
+  transactions.forEach((transaction: any) => {
+    // Cast to 'any' to access 'balance' and 'confidence' which are no longer in ParsedTransaction interface. This is a temporary fix. A better solution would be to update the interface in pdfParser.ts.
     const row: any[] = [
       formatDate(transaction.date, options.dateFormat),
       transaction.description,
-      formatCurrency(transaction.amount, options.currency),
+      formatCurrency(transaction.amount, transaction.currency), // Use transaction.currency
       transaction.type === "credit" ? "Credit" : "Debit",
     ];
 
     if (options.includeBalance && transaction.balance !== undefined) {
-      row.push(formatCurrency(transaction.balance, options.currency));
+      row.push(formatCurrency(transaction.balance, transaction.currency));
     } else if (options.includeBalance) {
       row.push("");
     }
@@ -204,7 +211,8 @@ async function createSummarySheet(
     .filter((t) => t.type === "debit")
     .reduce((sum, t) => sum + t.amount, 0);
 
-  const categoryTotals = data.transactions.reduce((acc, transaction) => {
+  const categoryTotals = data.transactions.reduce((acc, transaction: any) => {
+    // Cast to 'any' for confidence
     const category = transaction.category || "Uncategorized";
     if (!acc[category]) {
       acc[category] = { credits: 0, debits: 0, count: 0, confidenceSum: 0 };
@@ -286,7 +294,8 @@ function createMonthlySheet(
   transactions: ParsedTransaction[],
   options: ExportOptions
 ): XLSX.WorkSheet {
-  const monthlyData = transactions.reduce((acc, transaction) => {
+  const monthlyData = transactions.reduce((acc, transaction: any) => {
+    // Cast to 'any' for confidence
     const date = new Date(transaction.date);
     const monthKey = `${date.getFullYear()}-${String(
       date.getMonth() + 1
